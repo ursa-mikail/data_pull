@@ -1,7 +1,7 @@
 #!/bin/bash
-# download_all_json.sh
+# get_test_vectors_NIST.sh
 # Reads GitHub directory links from curl_list.txt
-# Downloads all *.json files into downloads/, preserving directory structure
+# Uses GitHub API to find actual files, then downloads via raw URLs
 
 INPUT_FILE="curl_list.txt"
 OUTPUT_DIR="downloads"
@@ -15,63 +15,85 @@ while IFS= read -r url; do
 
     echo "Processing: $url"
 
+    # Parse the GitHub URL
     # Example: https://github.com/usnistgov/ACVP-Server/tree/master/gen-val/json-files/ML-KEM-encapDecap-FIPS203
     owner=$(echo "$url" | cut -d/ -f4)
     repo=$(echo "$url" | cut -d/ -f5)
     branch=$(echo "$url" | cut -d/ -f7)
     path=$(echo "$url" | cut -d/ -f8-)
 
-    echo "  Owner: $owner, Repo: $repo, Branch: $branch, Path: $path"
+    echo "  Checking directory: $owner/$repo/$branch/$path"
 
     # GitHub API endpoint for listing directory contents
     api_url="https://api.github.com/repos/$owner/$repo/contents/$path?ref=$branch"
-    echo "  API URL: $api_url"
 
-    # Fetch JSON list of files in the directory with error handling
+    # Fetch directory contents
     api_response=$(curl -s "$api_url")
     
     # Check if the API response contains an error
     if echo "$api_response" | grep -q '"message":'; then
-        echo "  ERROR: API request failed"
-        echo "  Response: $api_response"
+        echo "  ✗ Directory not found or API error:"
+        echo "    $(echo "$api_response" | grep -o '"message":"[^"]*"')"
         continue
     fi
 
-    # Check if response is empty or malformed
+    # Check if response is empty
     if [[ -z "$api_response" || "$api_response" == "null" ]]; then
-        echo "  ERROR: Empty or null API response"
+        echo "  ✗ Empty API response"
         continue
     fi
 
-    # Extract download URLs for JSON files
-    json_urls=$(echo "$api_response" | grep '"download_url":' | grep '\.json"' | cut -d '"' -f4)
+    # Extract all files (not just JSON) to see what's available
+    all_files=$(echo "$api_response" | grep '"name":' | sed 's/.*"name": *"\([^"]*\)".*/\1/')
     
-    if [[ -z "$json_urls" ]]; then
-        echo "  WARNING: No JSON files found in this directory"
-        # Let's see what files are actually there
-        echo "  Available files:"
-        echo "$api_response" | grep '"name":' | cut -d '"' -f4 | sed 's/^/    /'
+    if [[ -z "$all_files" ]]; then
+        echo "  ✗ No files found in directory"
         continue
     fi
 
-    echo "$json_urls" | while read -r raw_url; do
-        [[ -z "$raw_url" ]] && continue
+    echo "  Available files:"
+    echo "$all_files" | sed 's/^/    /'
+
+    # Filter for JSON files
+    json_files=$(echo "$all_files" | grep '\.json$')
+    
+    if [[ -z "$json_files" ]]; then
+        echo "  ✗ No JSON files found"
+        continue
+    fi
+
+    echo "  JSON files to download:"
+    echo "$json_files" | sed 's/^/    /'
+
+    # Create local directory
+    local_dir="$OUTPUT_DIR/$path"
+    mkdir -p "$local_dir"
+
+    # Download each JSON file
+    echo "$json_files" | while IFS= read -r json_file; do
+        [[ -z "$json_file" ]] && continue
         
-        # Get the relative path inside repo
-        rel_path=$(echo "$raw_url" | sed -E "s#https://raw.githubusercontent.com/$owner/$repo/$branch/##")
-
-        # Construct full local path
-        local_path="$OUTPUT_DIR/$rel_path"
-
-        # Create directory structure if needed
-        mkdir -p "$(dirname "$local_path")"
-
-        echo "  Downloading $rel_path"
-        if ! curl -sL "$raw_url" -o "$local_path"; then
-            echo "  ERROR: Failed to download $raw_url"
+        # Construct raw URL
+        raw_url="https://raw.githubusercontent.com/$owner/$repo/refs/heads/$branch/$path/$json_file"
+        local_path="$local_dir/$json_file"
+        
+        echo "  Downloading: $json_file"
+        
+        if curl -sL "$raw_url" -o "$local_path"; then
+            if [[ -s "$local_path" ]]; then
+                echo "    ✓ Success: $json_file ($(stat -f%z "$local_path" 2>/dev/null || stat -c%s "$local_path" 2>/dev/null) bytes)"
+            else
+                echo "    ✗ Empty file: $json_file"
+                rm -f "$local_path"
+            fi
+        else
+            echo "    ✗ Download failed: $json_file"
+            rm -f "$local_path"
         fi
     done
 
 done < "$INPUT_FILE"
 
-echo "Download complete. Check the '$OUTPUT_DIR' directory for downloaded files."
+echo ""
+echo "Download summary:"
+find "$OUTPUT_DIR" -name "*.json" -exec echo "✓ {}" \; 2>/dev/null || echo "No files downloaded"
